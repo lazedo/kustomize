@@ -1,0 +1,263 @@
+# lazedo fork: build the kustomize CLI from the oci-source branch and publish
+# it as a GitHub release (binaries + checksums) and as a multi-arch image on
+# GHCR.
+#
+# The binaries are cross-compiled once (CGO_ENABLED=0) with the same
+# provenance ldflags the Makefile and releasing/create-release.sh use, so
+# `kustomize version` reports `git describe --tags`, e.g.
+# kustomize/v5.7.1-4-gfe5a20940. The image only copies the matching binary onto
+# a small alpine base (git + ssh, as in kustomize.Dockerfile), so each arch is
+# assembled on a NATIVE runner and joined by digest into one manifest. No QEMU.
+#
+# Names: a branch push releases as oci-<shortsha>; a lazedo/v* tag releases
+# under the tag name. Images always carry the short SHA and oci-latest.
+name: lazedo-release
+
+on:
+  push:
+    branches:
+      - oci-source
+    tags:
+      - 'lazedo/v*'
+  workflow_dispatch:
+
+concurrency:
+  group: lazedo-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kustomize
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      short: ${{ steps.meta.outputs.short }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: kustomize/go.mod
+          cache-dependency-path: |
+            kustomize/go.sum
+            api/go.sum
+            kyaml/go.sum
+
+      - name: Version metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(git describe --tags --always --dirty)"
+          short="${GITHUB_SHA::7}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="oci-${short}"
+          fi
+          {
+            echo "version=${version}"
+            echo "short=${short}"
+            echo "release_tag=${release_tag}"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=${version} short=${short} release=${release_tag}"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          build_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            echo "building ${os}/${arch}"
+            CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" \
+              go build -C kustomize -trimpath -o "../dist/kustomize_${os}_${arch}" -ldflags \
+              "-s -w \
+               -X sigs.k8s.io/kustomize/api/provenance.version=${VERSION} \
+               -X sigs.k8s.io/kustomize/api/provenance.buildDate=${build_date}" \
+              .
+          done
+          (cd dist && sha256sum kustomize_* > checksums.txt && cat checksums.txt)
+
+      - name: Smoke test (host arch)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          got="$(./dist/kustomize_linux_amd64 version)"
+          echo "kustomize version -> ${got}"
+          [ "${got}" = "${VERSION#kustomize/}" ] || { echo "::error::unexpected version ${got}, want ${VERSION#kustomize/}"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.release_tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SHORT: ${{ needs.build.outputs.short }}
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}:${SHORT}"
+          notes="kustomize ${VERSION} built from ${GITHUB_SHA} (${GITHUB_REF_NAME})"$'\n\n'"Image: ${image} (linux/amd64, linux/arm64)"
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${TAG} exists; replacing assets"
+            gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber dist/*
+          else
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" --title "${TAG}" --notes "${notes}" dist/*
+          fi
+          url="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json url --jq .url)"
+          echo "release: ${url}"
+          echo "Release [${TAG}](${url}) — ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: ctx
+
+      - name: Image context
+        run: |
+          set -euo pipefail
+          cat > ctx/Dockerfile <<'EOF'
+          FROM alpine:3.22
+          ARG TARGETOS
+          ARG TARGETARCH
+          RUN apk add --no-cache git openssh-client
+          COPY kustomize_${TARGETOS}_${TARGETARCH} /app/kustomize
+          WORKDIR /app
+          ENV PATH="$PATH:/app"
+          ENTRYPOINT ["/app/kustomize"]
+          EOF
+          chmod +x ctx/kustomize_*
+          ls -l ctx
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/kustomize-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-kustomize-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-kustomize-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Create multi-arch manifest
+        env:
+          SHORT: ${{ needs.build.outputs.short }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}"
+          TAGS="-t ${IMAGE}:${SHORT} -t ${IMAGE}:oci-latest"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAGS="${TAGS} -t ${IMAGE}:${GITHUB_REF_NAME#lazedo/}"
+          fi
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create ${TAGS} \
+            $(for f in /tmp/digests/*; do echo "${IMAGE}@$(cat "$f")"; done)
+          docker buildx imagetools inspect "${IMAGE}:${SHORT}"
+          echo "\`${IMAGE}:${SHORT}\` (amd64+arm64), also \`oci-latest\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Image tag must resolve on GHCR
+        # registry API probe, not `docker manifest inspect`: the docker CLI path
+        # fails against ghcr under GITHUB_TOKEN credentials even after a
+        # successful login and hides the reason; the token+manifests endpoints
+        # answer deterministically and the HTTP code is surfaced in the error.
+        env:
+          SHORT: ${{ needs.build.outputs.short }}
+          GH_USER: ${{ github.actor }}
+          GH_PASS: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}"
+          TOK=$(curl -fsSL -u "${GH_USER}:${GH_PASS}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TOK}" \
+            -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+            "https://ghcr.io/v2/${REPO}/manifests/${SHORT}")
+          [ "${CODE}" = "200" ] || { echo "::error::ghcr.io/${REPO}:${SHORT} is not on GHCR (HTTP ${CODE})"; exit 1; }
+          echo "ghcr.io/${REPO}:${SHORT} resolves (HTTP ${CODE})"
